@@ -7,7 +7,9 @@
       </div>
       <div class="page-actions">
         <button class="btn primary" type="button" @click="openCreate">登记对接任务</button>
-        <button class="btn" type="button" @click="exportRows">导出廊桥对接清单</button>
+        <button class="btn" type="button" :disabled="exporting" @click="exportRows">
+          {{ exporting ? '正在导出…' : '导出廊桥对接清单' }}
+        </button>
       </div>
     </header>
 
@@ -31,12 +33,17 @@
       <thead>
         <tr>
           <th v-for="column in columns" :key="column">{{ column }}</th>
+          <th>数据异常</th>
           <th>可执行动作</th>
         </tr>
       </thead>
       <tbody>
         <tr v-for="row in rows" :key="String(row.id)">
           <td v-for="column in columns" :key="column">{{ row[column] ?? '—' }}</td>
+          <td>
+            <span v-if="row['数据异常']" class="error-text">{{ row['数据异常'] }}</span>
+            <span v-else class="ok-text">正常</span>
+          </td>
           <td class="row-actions">
             <button
               v-for="action in actions"
@@ -50,7 +57,7 @@
           </td>
         </tr>
         <tr v-if="!rows.length">
-          <td :colspan="columns.length + 1" class="empty-state">暂无廊桥对接数据，可先登记对接任务</td>
+          <td :colspan="columns.length + 2" class="empty-state">暂无廊桥对接数据，可先登记对接任务</td>
         </tr>
       </tbody>
     </table>
@@ -78,16 +85,69 @@ const stats = [{"label": "待对接任务", "value": 0}, {"label": "对接中任
 const rows = ref<Row[]>([])
 const total = ref(0)
 const errorMessage = ref('')
+const exporting = ref(false)
 const filters = ref<Record<string, string>>({})
 const filterFields = columns.slice(0, 3)
+
+function activeQuery() {
+  // 只带上有值的筛选条件，列表和导出共用同一份查询串，保证条数对得上
+  const params = new URLSearchParams()
+  for (const field of filterFields) {
+    const value = (filters.value[field] ?? '').trim()
+    if (value) {
+      params.set(field, value)
+    }
+  }
+  return params.toString()
+}
 
 function resetFilters() {
   filters.value = {}
   void reload()
 }
 
-function exportRows() {
-  window.open(`${ENDPOINT}/export`, '_blank')
+function toCsv(data: Row[], headers: string[]): string {
+  const escape = (value: unknown) => {
+    const text = value === null || value === undefined ? '' : String(value)
+    return /[",\n\r]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text
+  }
+  const lines = [headers.map(escape).join(',')]
+  for (const row of data) {
+    lines.push(headers.map((header) => escape(row[header] ?? '')).join(','))
+  }
+  // 加 BOM，Excel 打开中文不乱码
+  return '﻿' + lines.join('\r\n')
+}
+
+async function exportRows() {
+  errorMessage.value = ''
+  exporting.value = true
+  try {
+    const query = activeQuery()
+    const response = await request(`${ENDPOINT}/export${query ? `?${query}` : ''}`)
+    if (!response.ok) {
+      throw new Error(`导出失败（接口返回 ${response.status}），文件未生成`)
+    }
+    const payload = await response.json()
+    const items: Row[] = payload.items ?? []
+    if (payload.total !== items.length) {
+      throw new Error(`导出条数与清单不一致（清单 ${payload.total} 条，实际导出 ${items.length} 条），请重试`)
+    }
+    const headers = [...columns, '数据异常']
+    const blob = new Blob([toCsv(items, headers)], { type: 'text/csv;charset=utf-8' })
+    const url = URL.createObjectURL(blob)
+    const link = document.createElement('a')
+    link.href = url
+    link.download = `廊桥对接清单_${new Date().toISOString().slice(0, 10)}.csv`
+    document.body.appendChild(link)
+    link.click()
+    link.remove()
+    URL.revokeObjectURL(url)
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : '廊桥对接清单导出失败'
+  } finally {
+    exporting.value = false
+  }
 }
 
 function openCreate() {
@@ -104,6 +164,10 @@ async function runAction(action: string, row: Row) {
     if (!response.ok) {
       throw new Error('廊桥对接动作未生效，请稍后重试')
     }
+    const payload = await response.json()
+    if (payload && payload.ok === false) {
+      throw new Error(payload.message || '廊桥对接动作未生效，请稍后重试')
+    }
     await reload()
   } catch (error) {
     errorMessage.value = error instanceof Error ? error.message : '廊桥对接操作失败'
@@ -112,9 +176,9 @@ async function runAction(action: string, row: Row) {
 
 async function reload() {
   errorMessage.value = ''
-  const query = new URLSearchParams(filters.value as Record<string, string>).toString()
+  const query = activeQuery()
   try {
-    const response = await request(`${ENDPOINT}?${query}`)
+    const response = await request(`${ENDPOINT}${query ? `?${query}` : ''}`)
     if (!response.ok) {
       throw new Error('对接任务列表读取失败')
     }
