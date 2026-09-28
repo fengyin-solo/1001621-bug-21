@@ -36,7 +36,10 @@
       </thead>
       <tbody>
         <tr v-for="row in rows" :key="String(row.id)">
-          <td v-for="column in columns" :key="column">{{ row[column] ?? '—' }}</td>
+          <td v-for="column in columns" :key="column">
+            <span v-if="column === issueField && row[column]" class="error-text">{{ row[column] }}</span>
+            <template v-else>{{ row[column] ?? '—' }}</template>
+          </td>
           <td class="row-actions">
             <button
               v-for="action in actions"
@@ -70,7 +73,8 @@ import { request } from '@/api/client'
 type Row = Record<string, string | number | null>
 
 const ENDPOINT = '/api/bridge'
-const columns = ["对接单号", "关联航班", "廊桥编号", "对接时刻", "撤桥时刻", "操作人员", "对接结果", "对接状态"]
+const issueField = '数据问题'
+const columns = ["对接单号", "关联航班", "廊桥编号", "对接时刻", "撤桥时刻", "操作人员", "对接结果", "对接状态", issueField]
 const actions = ["开始对接", "确认撤离", "取消对接"]
 const statuses = ["待对接", "对接中", "已撤离", "已取消"]
 const stats = [{"label": "待对接任务", "value": 0}, {"label": "对接中任务", "value": 0}, {"label": "本月对接次数", "value": 0}]
@@ -79,15 +83,52 @@ const rows = ref<Row[]>([])
 const total = ref(0)
 const errorMessage = ref('')
 const filters = ref<Record<string, string>>({})
-const filterFields = columns.slice(0, 3)
+const filterFields = ["对接单号", "关联航班", "廊桥编号"]
+
+// 页面中文字段与后端筛选参数的对应关系；列表和导出共用同一套口径
+const FILTER_PARAMS: Record<string, string> = {
+  对接单号: 'keyword',
+  关联航班: 'flight',
+  廊桥编号: 'bridge_no',
+}
+
+function buildQuery(): string {
+  const params = new URLSearchParams()
+  for (const field of filterFields) {
+    const value = filters.value[field]?.trim()
+    if (value) {
+      params.set(FILTER_PARAMS[field], value)
+    }
+  }
+  return params.toString()
+}
 
 function resetFilters() {
   filters.value = {}
   void reload()
 }
 
-function exportRows() {
-  window.open(`${ENDPOINT}/export`, '_blank')
+async function exportRows() {
+  errorMessage.value = ''
+  try {
+    // 带着当前筛选把全量清单取回来，由浏览器另存为文件
+    const query = buildQuery()
+    const response = await request(`${ENDPOINT}/export${query ? `?${query}` : ''}`)
+    if (!response.ok) {
+      throw new Error('廊桥对接清单导出失败，请稍后重试')
+    }
+    const blob = await response.blob()
+    const url = URL.createObjectURL(blob)
+    const link = document.createElement('a')
+    link.href = url
+    link.download = '廊桥对接清单.csv'
+    document.body.appendChild(link)
+    link.click()
+    link.remove()
+    URL.revokeObjectURL(url)
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : '廊桥对接清单导出失败'
+  }
 }
 
 function openCreate() {
@@ -101,8 +142,9 @@ async function runAction(action: string, row: Row) {
       method: 'POST',
       body: JSON.stringify({ action }),
     })
-    if (!response.ok) {
-      throw new Error('廊桥对接动作未生效，请稍后重试')
+    const payload = await response.json().catch(() => null)
+    if (!response.ok || !payload?.ok) {
+      throw new Error(payload?.message || '廊桥对接动作未生效，请稍后重试')
     }
     await reload()
   } catch (error) {
@@ -112,9 +154,9 @@ async function runAction(action: string, row: Row) {
 
 async function reload() {
   errorMessage.value = ''
-  const query = new URLSearchParams(filters.value as Record<string, string>).toString()
+  const query = buildQuery()
   try {
-    const response = await request(`${ENDPOINT}?${query}`)
+    const response = await request(`${ENDPOINT}${query ? `?${query}` : ''}`)
     if (!response.ok) {
       throw new Error('对接任务列表读取失败')
     }
